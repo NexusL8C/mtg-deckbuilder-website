@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Search,
   Plus,
@@ -979,6 +979,60 @@ export default function App() {
     [decks, activeDeckId]
   );
 
+  const [fanIndex, setFanIndex] = useState(0);
+  const [showSeparatedStacks, setShowSeparatedStacks] = useState(false);
+  const [miniFanIndices, setMiniFanIndices] = useState({});
+  const [miniTouchStart, setMiniTouchStart] = useState(null);
+
+  const fanEntries = useMemo(
+    () => activeDeck?.entries?.filter(({ zone }) => zone !== 'sideboard') || [],
+    [activeDeck]
+  );
+
+  useEffect(() => {
+    setFanIndex(0);
+    setMiniFanIndices({});
+  }, [activeDeckId]);
+
+  const cardTypeStacks = useMemo(() => {
+    const stackMap = new Map();
+
+    fanEntries.forEach((entry) => {
+      let label = getPrimaryCategory(entry.card?.type_line);
+      if (entry.zone === 'commander') label = 'Commander';
+
+      if (!stackMap.has(label)) {
+        stackMap.set(label, []);
+      }
+      stackMap.get(label).push(entry);
+    });
+
+    return [...stackMap.entries()]
+      .map(([label, entries]) => ({
+        label,
+        entries,
+        count: entries.reduce((sum, entry) => sum + (entry.quantity || 1), 0)
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [fanEntries]);
+
+  useEffect(() => {
+    if (!fanEntries.length) return;
+    const currentEntry = fanEntries[fanIndex];
+    if (currentEntry?.card) {
+      setInspectedCard(currentEntry.card);
+    }
+  }, [fanIndex, fanEntries]);
+
+  useEffect(() => {
+    if (!deckListScrollRef.current || !fanEntries[fanIndex]) return;
+    const activeEntry = fanEntries[fanIndex];
+    const activeRow = deckListScrollRef.current.querySelector(
+      `[data-deck-card-id="${activeEntry.card.id}"]`
+    );
+    activeRow?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [fanIndex, fanEntries]);
+
   // --- Card Search & Scryfall API State ---
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedColors, setSelectedColors] = useState([]);
@@ -987,10 +1041,24 @@ export default function App() {
   const [isSearching, setIsSearching] = useState(false);
   const [searchSource, setSearchSource] = useState('Starter Cache (Ready)');
   const [cardFaceMap, setCardFaceMap] = useState({}); // cardId -> 0 | 1 for double-faced cards
+  const [showCardBrowser, setShowCardBrowser] = useState(false);
+  const [showInspector, setShowInspector] = useState(false);
+  const [touchStart, setTouchStart] = useState(null);
+  const deckListScrollRef = useRef(null);
+  const [panelWidths, setPanelWidths] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('arcane-panel-widths') || '{}');
+      return {
+        left: typeof saved.left === 'number' ? saved.left : 350,
+        right: typeof saved.right === 'number' ? saved.right : 350
+      };
+    } catch {
+      return { left: 350, right: 350 };
+    }
+  });
 
   // --- Inspector & Workspace UI State ---
   const [inspectedCard, setInspectedCard] = useState(PRELOADED_CARDS[0]);
-  const [viewMode, setViewMode] = useState('stacks'); // 'stacks' | 'list'
   const [rightTab, setRightTab] = useState('analytics'); // 'analytics' | 'rules' | 'inspector'
   const [toast, setToast] = useState(null);
 
@@ -998,6 +1066,7 @@ export default function App() {
   const [showPlaytestModal, setShowPlaytestModal] = useState(false);
   const [showImportExportModal, setShowImportExportModal] = useState(false);
   const [showArchitectureModal, setShowArchitectureModal] = useState(false);
+  const [showRulesPopup, setShowRulesPopup] = useState(false);
   const [showNewDeckModal, setShowNewDeckModal] = useState(false);
   const [newDeckName, setNewDeckName] = useState('');
   const [newDeckFormat, setNewDeckFormat] = useState('commander');
@@ -1015,6 +1084,19 @@ export default function App() {
   // Show temporary notification toast
   const triggerToast = useCallback((message, type = 'info') => {
     setToast({ message, type });
+  }, []);
+
+  const resizePanel = useCallback((side, clientX) => {
+    const viewportWidth = window.innerWidth;
+    setPanelWidths((current) => {
+      const next =
+        side === 'left'
+          ? Math.max(240, Math.min(500, clientX))
+          : Math.max(240, Math.min(500, viewportWidth - clientX));
+      const updated = { ...current, [side]: next };
+      localStorage.setItem('arcane-panel-widths', JSON.stringify(updated));
+      return updated;
+    });
   }, []);
 
   const repairCardImage = useCallback(async (card, event, faceIndex = 0) => {
@@ -1140,6 +1222,7 @@ export default function App() {
   const addCardToDeck = useCallback(
     (card, zone = 'mainboard') => {
       setInspectedCard(card);
+      setShowInspector(true);
       updateActiveDeck((deck) => {
         let nextEntries = [...deck.entries];
 
@@ -1533,47 +1616,50 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
+    <div className="app-shell min-h-screen text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
       {/* ================================================================== */}
       {/* TOP NAVIGATION BAR                                                 */}
       {/* ================================================================== */}
-      <header className="sticky top-0 z-30 bg-slate-950/90 backdrop-blur-md border-b border-slate-800/80 px-4 py-2.5">
+      <header className="app-header sticky top-0 z-30 px-4 py-2.5">
         <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3 min-w-0">
-          {/* Brand Logo & School Project Badge */}
+          {/* Minimal brand */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-500 via-orange-600 to-violet-700 p-0.5 shadow-lg shadow-amber-500/10">
-              <div className="w-full h-full bg-slate-950 rounded-[10px] flex items-center justify-center">
-                <Sparkles className="w-5 h-5 text-amber-400" />
-              </div>
+            <div className="brand-mark w-9 h-9 rounded-full flex items-center justify-center">
+              <Sparkles className="w-4 h-4" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-extrabold tracking-tight bg-gradient-to-r from-amber-200 via-amber-400 to-violet-300 bg-clip-text text-transparent">
-                  ArcaneForge
-                </h1>
-                <span className="text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-300 border border-violet-500/30">
-                  MTG Architect
-                </span>
-              </div>
-              <p className="text-xs text-slate-400 hidden sm:block">
-                Scryfall-Powered Deckbuilder & Real-Time Rules Engine
-              </p>
-            </div>
+            <h1 className="brand-name text-base font-bold tracking-tight">
+              ArcaneForge
+            </h1>
           </div>
 
-          {/* Deck Selector & Format Switcher */}
+          {/* Deck actions */}
           <div className="flex flex-wrap items-center justify-end gap-2 min-w-0">
-            <div className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-1 min-w-0">
-              <Layers className="w-4 h-4 text-amber-400 ml-2 mr-1.5 shrink-0" />
+            <button
+              onClick={() => setShowCardBrowser((current) => !current)}
+              className={`app-icon-button ${showCardBrowser ? 'is-active' : ''}`}
+              title="Browse cards"
+            >
+              <Search className="w-4 h-4" />
+              <span className="hidden sm:inline">Cards</span>
+            </button>
+            <button
+              onClick={() => setShowInspector((current) => !current)}
+              className={`app-icon-button ${showInspector ? 'is-active' : ''}`}
+              title="Inspect card"
+            >
+              <Eye className="w-4 h-4" />
+            </button>
+            <div className="deck-selector flex items-center rounded-lg p-1 min-w-0">
+              <Layers className="w-4 h-4 ml-2 mr-1.5 shrink-0" />
               <select
                 value={activeDeck.id}
                 onChange={(e) => setActiveDeckId(e.target.value)}
-                className="bg-transparent text-sm font-semibold text-slate-100 pr-6 py-1 focus:outline-none cursor-pointer max-w-[18rem] truncate"
+                className="bg-transparent text-sm font-semibold pr-5 py-1.5 focus:outline-none cursor-pointer max-w-[16rem] truncate"
                 aria-label="Select Active Deck"
               >
                 {decks.map((d) => (
                   <option key={d.id} value={d.id} className="bg-slate-900 text-slate-100">
-                    {d.name} ({d.format.toUpperCase()})
+                    {d.name}
                   </option>
                 ))}
               </select>
@@ -1581,10 +1667,11 @@ export default function App() {
 
             <button
               onClick={() => setShowNewDeckModal(true)}
-              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition"
+              className="app-icon-button"
+              title="New Deck"
             >
-              <Plus className="w-3.5 h-3.5" />
-              New Deck
+              <Plus className="w-4 h-4" />
+              <span className="hidden md:inline">New</span>
             </button>
 
             <button
@@ -1592,43 +1679,39 @@ export default function App() {
                 startNewOpeningHand(0);
                 setShowPlaytestModal(true);
               }}
-              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 bg-violet-600/20 hover:bg-violet-600/30 text-violet-200 border border-violet-500/30 transition"
+              className="app-icon-button"
+              title="Test Hand"
             >
-              <Shuffle className="w-3.5 h-3.5 text-violet-400" />
-              Test Hand
+              <Shuffle className="w-4 h-4" />
+              <span className="hidden md:inline">Test</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowSeparatedStacks((current) => !current)}
+              className={`app-icon-button ${showSeparatedStacks ? 'is-active' : ''}`}
+              title={showSeparatedStacks ? 'Show one card stack' : 'Arrange cards by type'}
+              aria-pressed={showSeparatedStacks}
+            >
+              <LayoutGrid className="w-4 h-4" />
+              <span className="hidden md:inline">
+                {showSeparatedStacks ? 'Single stack' : 'Stacks'}
+              </span>
             </button>
 
             <button
               onClick={() => setShowImportExportModal(true)}
-              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 transition"
+              className="app-icon-button"
+              title="Import / Export"
             >
-              <ArrowRightLeft className="w-3.5 h-3.5 text-slate-400" />
-              Import / Export
+              <ArrowRightLeft className="w-4 h-4" />
             </button>
 
-            <button
-              onClick={() => setShowArchitectureModal(true)}
-              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition"
-              title="View Full-Stack School Project Architecture"
-            >
-              <Database className="w-3.5 h-3.5" />
-              System Stack
-            </button>
-
-            {authLoading ? (
-              <span className="text-xs text-slate-500 px-2">Checking account...</span>
-            ) : user ? (
-              <div className="inline-flex items-center gap-2 rounded-lg bg-slate-900 border border-slate-700 px-2 py-1">
+            {authLoading ? null : user ? (
+              <div className="inline-flex items-center gap-2">
                 {user.avatar_url && (
-                  <img
-                    src={user.avatar_url}
-                    alt=""
-                    className="w-5 h-5 rounded-full"
-                  />
+                  <img src={user.avatar_url} alt="" className="w-7 h-7 rounded-full" />
                 )}
-                <span className="text-xs font-semibold text-slate-200 max-w-[9rem] truncate">
-                  {user.display_name}
-                </span>
                 <button
                   onClick={async () => {
                     await fetch('/api/auth/logout', { method: 'POST' });
@@ -1636,9 +1719,10 @@ export default function App() {
                     setPersistenceReady(false);
                     triggerToast('Signed out.');
                   }}
-                  className="text-[11px] font-bold text-slate-400 hover:text-slate-100 whitespace-nowrap"
+                  className="app-icon-button"
+                  title="Sign out"
                 >
-                  Sign out
+                  <X className="w-4 h-4" />
                 </button>
               </div>
             ) : (
@@ -1686,11 +1770,33 @@ export default function App() {
       {/* ================================================================== */}
       {/* MAIN 3-COLUMN WORKSPACE                                            */}
       {/* ================================================================== */}
-      <main className="flex-1 max-w-[1600px] w-full mx-auto grid grid-cols-1 lg:grid-cols-[minmax(260px,300px)_minmax(0,1fr)_minmax(280px,320px)] gap-4 p-4 min-w-0">
+      <main
+        className="game-workspace flex-1 w-full mx-auto p-4 min-w-0"
+        style={{
+          '--left-panel-width': `${showCardBrowser ? panelWidths.left : 0}px`,
+          '--right-panel-width': `${showInspector ? panelWidths.right : 0}px`
+        }}
+      >
         {/* ---------------------------------------------------------------- */}
         {/* LEFT COLUMN (3 cols): LIVE SCRYFALL CARD SEARCH & FILTERS        */}
         {/* ---------------------------------------------------------------- */}
-        <section className="h-[600px] max-h-[600px] self-start min-h-0 bg-slate-900/70 border border-slate-800/90 rounded-2xl flex flex-col overflow-hidden min-w-0">
+        <section className={`card-browser ${showCardBrowser ? 'is-open' : ''}`}>
+          <button
+            type="button"
+            className="panel-resize-handle panel-resize-handle-right"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              const move = (moveEvent) =>
+                resizePanel('left', moveEvent.clientX);
+              const up = () => {
+                window.removeEventListener('mousemove', move);
+                window.removeEventListener('mouseup', up);
+              };
+              window.addEventListener('mousemove', move);
+              window.addEventListener('mouseup', up);
+            }}
+            aria-label="Resize card browser"
+          />
           <div className="p-3.5 border-b border-slate-800 space-y-3 bg-slate-900/90 min-w-0">
             <div className="flex items-center justify-between gap-2 min-w-0">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5 min-w-0">
@@ -1803,6 +1909,7 @@ export default function App() {
                     key={card.id}
                     onClick={() => {
                       setInspectedCard(card);
+                      setShowInspector(true);
                     }}
                     className={`group flex gap-3 p-2 rounded-xl border transition cursor-pointer ${
                       inspectedCard?.id === card.id
@@ -1898,11 +2005,11 @@ export default function App() {
         {/* ---------------------------------------------------------------- */}
         {/* CENTER WORKSPACE (6 cols): DECK HEADER, STATUS & VISUAL STACKS   */}
         {/* ---------------------------------------------------------------- */}
-        <section className="min-w-0 flex flex-col gap-4">
+        <section className="game-table min-w-0 flex flex-col gap-4">
           {/* Deck Header Card */}
-          <div className="bg-gradient-to-br from-slate-900 via-slate-900 to-indigo-950/40 border border-slate-800 rounded-2xl p-4 shadow-xl">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="space-y-1 flex-1 min-w-[220px]">
+          <div className="deck-header-card bg-gradient-to-br from-slate-900 via-slate-900 to-indigo-950/40 border border-slate-800 rounded-2xl p-4 shadow-xl">
+            <div className="deck-header-row flex flex-wrap items-start justify-between gap-3">
+              <div className="deck-name-block space-y-1 flex-1 min-w-[220px]">
                 <div className="flex items-center gap-2 flex-wrap">
                   <input
                     type="text"
@@ -1914,12 +2021,11 @@ export default function App() {
                     aria-label="Deck Name"
                   />
                 </div>
-                <p className="text-xs text-slate-400">{activeDeck.description}</p>
               </div>
 
               {/* Format Selector & View Mode Toggle */}
-              <div className="flex items-center gap-2 flex-wrap">
-                <div className="inline-flex rounded-xl bg-slate-950 p-1 border border-slate-800">
+              <div className="deck-header-controls flex items-center gap-2 flex-wrap">
+                <div className="format-selector inline-flex rounded-xl bg-slate-950 p-1 border border-slate-800">
                   {['commander', 'modern', 'standard'].map((fmt) => (
                     <button
                       key={fmt}
@@ -1935,32 +2041,6 @@ export default function App() {
                   ))}
                 </div>
 
-                <div className="inline-flex rounded-xl bg-slate-950 p-1 border border-slate-800">
-                  <button
-                    onClick={() => setViewMode('stacks')}
-                    className={`p-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition ${
-                      viewMode === 'stacks'
-                        ? 'bg-slate-800 text-amber-300'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                    title="Visual Card Stacks View"
-                  >
-                    <LayoutGrid className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Stacks</span>
-                  </button>
-                  <button
-                    onClick={() => setViewMode('list')}
-                    className={`p-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition ${
-                      viewMode === 'list'
-                        ? 'bg-slate-800 text-amber-300'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                    title="Compact Table View"
-                  >
-                    <List className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Table</span>
-                  </button>
-                </div>
               </div>
             </div>
 
@@ -1968,8 +2048,9 @@ export default function App() {
             <div className="mt-4 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
               {/* Legality Badge */}
               <button
-                onClick={() => setRightTab('rules')}
-                className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
+                onClick={() => setShowRulesPopup((open) => !open)}
+                aria-expanded={showRulesPopup}
+                className={`deck-rule-status inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
                   validation.overall === 'legal'
                     ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
                     : validation.overall === 'incomplete'
@@ -2036,264 +2117,409 @@ export default function App() {
             </div>
           </div>
 
-          {/* Categorized Deck Content (Visual Stacks OR Compact Table) */}
-          {viewMode === 'stacks' ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {groupedSections.map(([sectionTitle, entries]) => {
-                const sectionTotal = entries.reduce((sum, e) => sum + e.quantity, 0);
-                const isCommanderSection = sectionTitle === 'Commander';
+          {/* Whole-deck analytics */}
+          <div className="deck-analytics" aria-label="Deck analytics">
+            <div className="deck-analytics-section deck-analytics-curve">
+              <span className="deck-analytics-label">Mana curve</span>
+              <div className="mini-curve" aria-label={`Average CMC ${analytics.avgCmc}`}>
+                {analytics.curveBins.map((bin) => {
+                  const maxCount = Math.max(
+                    1,
+                    ...analytics.curveBins.map((item) => item.count)
+                  );
+                  return (
+                    <div className="mini-curve-column" key={bin.cmc}>
+                      <span
+                        className="mini-curve-bar"
+                        style={{ height: `${Math.max(6, (bin.count / maxCount) * 72)}px` }}
+                      />
+                      <span className="mini-curve-label">{bin.cmc}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mini-curve-average" aria-label="Average mana value">
+                <span>AVG</span>
+                <strong>{analytics.avgCmc}</strong>
+              </div>
+            </div>
 
-                return (
+            <div className="deck-analytics-section deck-analytics-colors">
+              <span className="deck-analytics-label">Identity</span>
+              <div className="mini-colors">
+                {analytics.colorPieData.map((item) => (
                   <div
-                    key={sectionTitle}
-                    className={`rounded-2xl border p-3.5 flex flex-col justify-between ${
-                      isCommanderSection
-                        ? 'md:col-span-2 bg-gradient-to-r from-violet-950/40 via-slate-900 to-amber-950/30 border-amber-500/40'
-                        : 'bg-slate-900/60 border-slate-800/90'
-                    }`}
+                    className="mini-color"
+                    key={item.code}
+                    title={`${item.name}: ${item.value}`}
                   >
+                    <span
+                      className="mini-color-dot"
+                      style={{ backgroundColor: item.color }}
+                    />
+                    <span>{item.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="deck-analytics-section deck-analytics-types">
+              <span className="deck-analytics-label">Types</span>
+              <div className="mini-types">
+                {Object.entries(analytics.typeCounts).map(([type, count]) => (
+                  <div className="mini-type" key={type}>
+                    <span>{type}</span>
+                    <strong>{count}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+          </div>
+
+          {showRulesPopup && (
+            <div
+              className="rules-popup"
+              role="dialog"
+              aria-label="Rules validation"
+              ref={(popup) => {
+                if (!popup || window.innerWidth <= 800) return;
+                const anchor = document.querySelector('.deck-rule-status');
+                if (!anchor) return;
+                const rect = anchor.getBoundingClientRect();
+                const width = Math.min(420, window.innerWidth - 24);
+                const left = Math.max(
+                  12,
+                  Math.min(rect.right - width, window.innerWidth - width - 12)
+                );
+                const desiredTop = rect.bottom + 8;
+                const height = Math.min(
+                  360,
+                  Math.max(180, window.innerHeight - desiredTop - 12)
+                );
+                popup.style.left = `${left}px`;
+                popup.style.right = 'auto';
+                popup.style.top = `${desiredTop}px`;
+                popup.style.bottom = 'auto';
+                popup.style.width = `${width}px`;
+                popup.style.height = `${height}px`;
+                popup.style.maxHeight = `${height}px`;
+                popup.style.transform = 'none';
+              }}
+            >
+              <div className="rules-popup-header">
+                <strong>{activeDeck.format.toUpperCase()} Rules</strong>
+                <button
+                  type="button"
+                  onClick={() => setShowRulesPopup(false)}
+                  aria-label="Close rules"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+              <div className="rules-popup-list">
+                {validation.checks.map((check) => (
+                  <div className={`rules-popup-row is-${check.status}`} key={check.id}>
+                    <span className="rules-popup-icon" aria-hidden="true">
+                      {check.status === 'pass'
+                        ? '✅'
+                        : check.status === 'warn'
+                        ? '🟡'
+                        : '❌'}
+                    </span>
                     <div>
-                      <div className="flex items-center justify-between pb-2.5 mb-3 border-b border-slate-800/80">
-                        <div className="flex items-center gap-2">
-                          {isCommanderSection && (
-                            <Crown className="w-4 h-4 text-amber-400" />
-                          )}
-                          <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-200">
-                            {sectionTitle}
-                          </h3>
-                        </div>
-                        <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-slate-800 text-amber-300">
-                          {sectionTotal} {sectionTotal === 1 ? 'card' : 'cards'}
-                        </span>
-                      </div>
-
-                      {entries.length === 0 ? (
-                        <div className="py-4 text-center text-xs text-slate-400">
-                          No Commander selected yet. Click{' '}
-                          <span className="text-violet-300 font-semibold">Cmdr</span> on any
-                          Legendary creature in the search panel.
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          {entries.map((entry) => {
-                            const { card, quantity, zone } = entry;
-                            const cmdrColors = new Set(
-                              activeDeck.entries.find((e) => e.zone === 'commander')?.card
-                                ?.color_identity || []
-                            );
-                            const hasColorViolation =
-                              activeDeck.format === 'commander' &&
-                              zone !== 'commander' &&
-                              cmdrColors.size > 0 &&
-                              (card.color_identity || []).some((c) => !cmdrColors.has(c));
-
-                            const formatLegality = card.legalities?.[activeDeck.format];
-                            const isFormatIllegal =
-                              formatLegality &&
-                              formatLegality !== 'legal' &&
-                              formatLegality !== 'restricted';
-
-                            return (
-                              <div
-                                key={`${zone}-${card.name}`}
-                                onClick={() => setInspectedCard(card)}
-                                className={`group flex items-center justify-between gap-2 p-2 rounded-xl border transition cursor-pointer ${
-                                  hasColorViolation || isFormatIllegal
-                                    ? 'bg-rose-950/40 border-rose-500/60 hover:bg-rose-950/60'
-                                    : inspectedCard?.name === card.name
-                                    ? 'bg-slate-800/90 border-amber-500/50'
-                                    : 'bg-slate-950/70 hover:bg-slate-900 border-slate-800/80'
-                                }`}
-                              >
-                                <div className="flex items-center gap-2.5 min-w-0">
-                                  {/* Mini Card Art Preview */}
-                                  <img
-                                    src={getCardImage(card, cardFaceMap[card.id] || 0)}
-                                    alt={card.name}
-                                    onError={(e) =>
-                                      repairCardImage(card, e, cardFaceMap[card.id] || 0)
-                                    }
-                                    className="w-9 h-12 rounded-md object-cover object-top border border-slate-700 shrink-0"
-                                  />
-                                  <div className="min-w-0">
-                                    <div className="flex items-center gap-1.5">
-                                      <span className="px-1.5 py-0.5 rounded bg-slate-800 text-amber-300 font-extrabold text-[11px]">
-                                        {quantity}x
-                                      </span>
-                                      <span className="text-xs font-bold text-slate-100 truncate">
-                                        {card.name}
-                                      </span>
-                                      {(hasColorViolation || isFormatIllegal) && (
-                                        <AlertTriangle
-                                          className="w-3.5 h-3.5 text-rose-400 shrink-0"
-                                          title={
-                                            hasColorViolation
-                                              ? 'Outside Commander Color Identity'
-                                              : `Not legal in ${activeDeck.format}`
-                                          }
-                                        />
-                                      )}
-                                    </div>
-                                    <div className="flex items-center gap-2 mt-1">
-                                      <ManaCostBadges manaCost={card.mana_cost} size="sm" />
-                                      <span className="text-[10px] text-slate-400 truncate">
-                                        {card.type_line}
-                                      </span>
-                                    </div>
-                                  </div>
-                                </div>
-
-                                {/* Quantity & Zone Controls */}
-                                <div
-                                  className="flex items-center gap-1 shrink-0"
-                                  onClick={(e) => e.stopPropagation()}
-                                >
-                                  {zone !== 'commander' && (
-                                    <>
-                                      <button
-                                        onClick={() =>
-                                          changeCardQuantity(card.name, zone, -1)
-                                        }
-                                        className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 transition"
-                                        title="Remove 1 copy"
-                                      >
-                                        <Minus className="w-3 h-3" />
-                                      </button>
-                                      <button
-                                        onClick={() =>
-                                          changeCardQuantity(card.name, zone, 1)
-                                        }
-                                        className="p-1 rounded-lg bg-slate-900 hover:bg-emerald-500/20 text-slate-400 hover:text-emerald-300 border border-slate-800 transition"
-                                        title="Add 1 copy"
-                                      >
-                                        <Plus className="w-3 h-3" />
-                                      </button>
-                                    </>
-                                  )}
-
-                                  {zone === 'mainboard' &&
-                                    activeDeck.format === 'commander' &&
-                                    (card.type_line || '').includes('Legendary') && (
-                                      <button
-                                        onClick={() =>
-                                          moveCardZone(card, 'mainboard', 'commander')
-                                        }
-                                        className="p-1 rounded-lg bg-violet-500/20 hover:bg-violet-500 text-violet-300 hover:text-white border border-violet-500/30 transition"
-                                        title="Promote to Commander"
-                                      >
-                                        <Crown className="w-3 h-3" />
-                                      </button>
-                                    )}
-
-                                  {zone === 'commander' && (
-                                    <button
-                                      onClick={() =>
-                                        moveCardZone(card, 'commander', 'mainboard')
-                                      }
-                                      className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-slate-300"
-                                    >
-                                      To Main
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
+                      <strong>{check.title}</strong>
+                      <p>{check.detail}</p>
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          ) : (
-            /* Compact Table View */
-            <div className="bg-slate-900/70 border border-slate-800 rounded-2xl overflow-hidden">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400 uppercase text-[11px]">
-                      <th className="py-2.5 px-3">Qty</th>
-                      <th className="py-2.5 px-3">Card Name</th>
-                      <th className="py-2.5 px-3">Mana Cost</th>
-                      <th className="py-2.5 px-3">Type</th>
-                      <th className="py-2.5 px-3">Zone</th>
-                      <th className="py-2.5 px-3 text-right">EUR / USD</th>
-                      <th className="py-2.5 px-3 text-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/60">
-                    {activeDeck.entries.map(({ card, quantity, zone }) => (
-                      <tr
-                        key={`${zone}-${card.name}`}
-                        onClick={() => setInspectedCard(card)}
-                        className="hover:bg-slate-800/60 cursor-pointer transition"
-                      >
-                        <td className="py-2 px-3 font-extrabold text-amber-300">
-                          {quantity}x
-                        </td>
-                        <td className="py-2 px-3 font-bold text-slate-100">{card.name}</td>
-                        <td className="py-2 px-3">
-                          <ManaCostBadges manaCost={card.mana_cost} size="sm" />
-                        </td>
-                        <td className="py-2 px-3 text-slate-400 truncate max-w-[160px]">
-                          {card.type_line}
-                        </td>
-                        <td className="py-2 px-3">
-                          <span
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                              zone === 'commander'
-                                ? 'bg-violet-500/20 text-violet-300'
-                                : zone === 'sideboard'
-                                ? 'bg-sky-500/20 text-sky-300'
-                                : 'bg-slate-800 text-slate-300'
-                            }`}
-                          >
-                            {zone}
-                          </span>
-                        </td>
-                        <td className="py-2 px-3 text-right font-semibold text-emerald-400">
-                          €{((parseFloat(card.prices?.eur || 0) || 0) * quantity).toFixed(2)}
-                        </td>
-                        <td
-                          className="py-2 px-3 text-right"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <div className="inline-flex items-center gap-1">
-                            <button
-                              onClick={() => changeCardQuantity(card.name, zone, -1)}
-                              className="p-1 rounded bg-slate-800 hover:bg-rose-500/20 text-slate-300"
-                            >
-                              <Minus className="w-3 h-3" />
-                            </button>
-                            <button
-                              onClick={() => changeCardQuantity(card.name, zone, 1)}
-                              className="p-1 rounded bg-slate-800 hover:bg-emerald-500/20 text-slate-300"
-                            >
-                              <Plus className="w-3 h-3" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                ))}
               </div>
             </div>
           )}
+
+          {/* Card stack */}
+          <div
+              className={`card-fan ${showSeparatedStacks ? 'is-separated' : ''}`}
+              aria-label="Cards in the deck"
+              onTouchStart={(event) => {
+                const touch = event.touches[0];
+                setTouchStart({ x: touch.clientX, y: touch.clientY });
+              }}
+              onTouchEnd={(event) => {
+                if (showSeparatedStacks) return;
+                if (!touchStart || !fanEntries.length) return;
+                const touch = event.changedTouches[0];
+                const deltaX = touch.clientX - touchStart.x;
+                const deltaY = touch.clientY - touchStart.y;
+                setTouchStart(null);
+
+                if (Math.abs(deltaX) < 38 && Math.abs(deltaY) < 38) return;
+
+                if (Math.abs(deltaX) >= Math.abs(deltaY)) {
+                  setFanIndex((current) =>
+                    deltaX < 0
+                      ? (current + 1) % fanEntries.length
+                      : (current - 1 + fanEntries.length) % fanEntries.length
+                  );
+                } else {
+                  setFanIndex((current) =>
+                    deltaY < 0
+                      ? (current + 1) % fanEntries.length
+                      : (current - 1 + fanEntries.length) % fanEntries.length
+                  );
+                }
+              }}
+              onWheel={(event) => {
+                if (showSeparatedStacks) return;
+                if (!fanEntries.length) return;
+                if (Math.abs(event.deltaY) < 8) return;
+                setFanIndex((current) =>
+                  event.deltaY > 0
+                    ? (current + 1) % fanEntries.length
+                    : (current - 1 + fanEntries.length) % fanEntries.length
+                );
+              }}
+            >
+              {showSeparatedStacks ? (
+                cardTypeStacks.length > 0 ? (
+                  <div className="card-stack-groups" aria-label="Cards arranged by type">
+                    {cardTypeStacks.map((stack, stackIndex) => (
+                      <section
+                        className="card-type-stack"
+                        key={stack.label}
+                        style={{ '--stack-index': stackIndex }}
+                        aria-label={`${stack.label}, ${stack.count} cards`}
+                        onWheel={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          if (stack.entries.length < 2 || Math.abs(event.deltaY) < 8) return;
+                          const miniIndex = miniFanIndices[stack.label] || 0;
+                          const nextIndex = event.deltaY > 0
+                            ? (miniIndex + 1) % stack.entries.length
+                            : (miniIndex - 1 + stack.entries.length) % stack.entries.length;
+                          setMiniFanIndices((current) => ({
+                            ...current,
+                            [stack.label]: nextIndex
+                          }));
+                          setInspectedCard(stack.entries[nextIndex].card);
+                        }}
+                        onTouchStart={(event) => {
+                          const touch = event.touches[0];
+                          setMiniTouchStart({ x: touch.clientX, y: touch.clientY, label: stack.label });
+                        }}
+                        onTouchEnd={(event) => {
+                          if (!miniTouchStart || miniTouchStart.label !== stack.label) return;
+                          const touch = event.changedTouches[0];
+                          const deltaX = touch.clientX - miniTouchStart.x;
+                          const deltaY = touch.clientY - miniTouchStart.y;
+                          setMiniTouchStart(null);
+                          if (Math.max(Math.abs(deltaX), Math.abs(deltaY)) < 38) return;
+                          const miniIndex = miniFanIndices[stack.label] || 0;
+                          const forward = Math.abs(deltaX) >= Math.abs(deltaY)
+                            ? deltaX < 0
+                            : deltaY < 0;
+                          const nextIndex = forward
+                            ? (miniIndex + 1) % stack.entries.length
+                            : (miniIndex - 1 + stack.entries.length) % stack.entries.length;
+                          setMiniFanIndices((current) => ({
+                            ...current,
+                            [stack.label]: nextIndex
+                          }));
+                          setInspectedCard(stack.entries[nextIndex].card);
+                        }}
+                      >
+                        <div className="card-type-stack-header">
+                          <span>{stack.label}</span>
+                          <strong>{stack.count}</strong>
+                        </div>
+                        <div className="card-type-stack-cards">
+                          {stack.entries.map((entry, entryIndex) => {
+                            const miniIndex = miniFanIndices[stack.label] || 0;
+                            const offset = (
+                              entryIndex - miniIndex + stack.entries.length
+                            ) % stack.entries.length;
+                            if (offset > 3) return null;
+
+                            return (
+                              <button
+                                type="button"
+                                className={`separated-card ${
+                                  offset === 0 ? 'is-selected' : ''
+                                }`}
+                                key={`${entry.zone}-${entry.card.id}-${entry.card.name}`}
+                                style={{ '--card-index': offset, zIndex: 10 - offset }}
+                                onClick={() => {
+                                  setMiniFanIndices((current) => ({
+                                    ...current,
+                                    [stack.label]: entryIndex
+                                  }));
+                                  setFanIndex(
+                                    Math.max(0, fanEntries.findIndex(
+                                      (item) =>
+                                        item.card.id === entry.card.id &&
+                                        item.card.name === entry.card.name
+                                    ))
+                                  );
+                                  setInspectedCard(entry.card);
+                                  setShowInspector(true);
+                                }}
+                                title={`${entry.card.name} — ${entry.quantity}×`}
+                              >
+                                <img
+                                  src={getCardImage(entry.card, cardFaceMap[entry.card.id] || 0)}
+                                  alt={entry.card.name}
+                                  onError={(event) =>
+                                    repairCardImage(entry.card, event, cardFaceMap[entry.card.id] || 0)
+                                  }
+                                />
+                                {entry.quantity > 1 && (
+                                  <span className="fan-card-count">{entry.quantity}</span>
+                                )}
+                              </button>
+                            );
+                          })}
+                          <span className="mini-stack-status">
+                            {(miniFanIndices[stack.label] || 0) + 1}/{stack.entries.length}
+                          </span>
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-table">No cards on the table</div>
+                )
+              ) : fanEntries.length > 0 ? (
+                <>
+                  {fanEntries.map(({ card, quantity, zone }, index) => {
+                    const offset =
+                      (index - fanIndex + fanEntries.length) % fanEntries.length;
+                    const isVisible = offset <= 3;
+
+                    if (!isVisible) return null;
+
+                    return (
+                      <button
+                        key={`${zone}-${card.name}`}
+                        type="button"
+                        draggable
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = 'move';
+                          event.dataTransfer.setData('text/plain', `${zone}:${card.name}`);
+                        }}
+                        onDragOver={(event) => {
+                          event.preventDefault();
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          const source = event.dataTransfer
+                            .getData('text/plain')
+                            .split(':');
+                          const sourceName = source.slice(1).join(':');
+                          updateActiveDeck((deck) => {
+                            const fromIndex = deck.entries.findIndex(
+                              (entry) => entry.card.name === sourceName
+                            );
+                            const toIndex = deck.entries.findIndex(
+                              (entry) =>
+                                entry.card.name === card.name && entry.zone === zone
+                            );
+                            if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+                              return deck;
+                            }
+                            const nextEntries = [...deck.entries];
+                            const [moved] = nextEntries.splice(fromIndex, 1);
+                            nextEntries.splice(toIndex, 0, moved);
+                            return { ...deck, entries: nextEntries };
+                          });
+                          setFanIndex(index);
+                        }}
+                        className={`stack-card ${
+                          offset === 0 ? 'is-current' : ''
+                        }`}
+                        style={{
+                          '--card-offset': offset,
+                          zIndex: 20 - offset,
+                          transform: `translateX(${offset * 16}px) translateY(${offset * 16}px) rotate(${offset * 1.1}deg) scale(${offset === 0 ? 1 : 0.985 - offset * 0.012})`,
+                        }}
+                        onClick={() => {
+                          setFanIndex(index);
+                          setInspectedCard(card);
+                          setShowInspector((open) =>
+                            inspectedCard?.id === card.id ? !open : true
+                          );
+                        }}
+                        title={`${card.name} — drag to reorder`}
+                      >
+                        <img
+                          src={getCardImage(card, cardFaceMap[card.id] || 0)}
+                          alt={card.name}
+                          draggable="false"
+                          onError={(e) =>
+                            repairCardImage(card, e, cardFaceMap[card.id] || 0)
+                          }
+                        />
+                        {quantity > 1 && (
+                          <span className="fan-card-count">{quantity}</span>
+                        )}
+                        {zone === 'commander' && (
+                          <span className="fan-card-zone">
+                            <Crown className="w-3 h-3" />
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+
+                  <div className="stack-status">
+                    <span>{fanIndex + 1}</span>
+                    <span className="stack-status-divider" />
+                    <span>{fanEntries.length}</span>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-table">No cards on the table</div>
+              )}
+            </div>
         </section>
 
         {/* ---------------------------------------------------------------- */}
         {/* RIGHT PANEL (3 cols): CARD INSPECTOR, ANALYTICS & RULES CHECKLIST */}
         {/* ---------------------------------------------------------------- */}
-        <aside className="min-w-0 flex flex-col gap-4">
+        <aside className={`card-inspector ${showInspector ? 'is-open' : ''}`}>
+          <button
+            type="button"
+            className="panel-resize-handle panel-resize-handle-left"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              const move = (moveEvent) =>
+                resizePanel('right', moveEvent.clientX);
+              const up = () => {
+                window.removeEventListener('mousemove', move);
+                window.removeEventListener('mouseup', up);
+              };
+              window.addEventListener('mousemove', move);
+              window.addEventListener('mouseup', up);
+            }}
+            aria-label="Resize card inspector"
+          />
           {/* Card Inspector Spotlight */}
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3.5 space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
-                <Eye className="w-3.5 h-3.5 text-amber-400" />
-                Card Inspector
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowInspector(false)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                  title="Close card inspector"
+                  aria-label="Close card inspector"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                  <Eye className="w-3.5 h-3.5 text-amber-400" />
+                  Card Inspector
+                </span>
+              </div>
               {isDoubleFaced(inspectedCard) && (
                 <button
                   onClick={() => toggleCardFlip(inspectedCard.id)}
@@ -2529,6 +2755,49 @@ export default function App() {
                 </div>
               </div>
             )}
+          </div>
+        </aside>
+        <aside className="deck-table-panel" aria-label="Deck card table">
+          <div className="deck-list-header">
+            <span>All cards</span>
+            <strong>{activeDeck.entries.reduce((sum, entry) => sum + entry.quantity, 0)}</strong>
+          </div>
+          <div className="deck-list-scroll" ref={deckListScrollRef}>
+            {activeDeck.entries.map(({ card, quantity, zone }) => (
+              <button
+                type="button"
+                key={`${zone}-${card.id}-${card.name}`}
+                data-deck-card-id={card.id}
+                className={`deck-list-row ${
+                  inspectedCard?.id === card.id ? 'is-selected' : ''
+                }`}
+                onClick={() => {
+                  setInspectedCard(card);
+                  setShowInspector(true);
+                  setFanIndex(
+                    Math.max(
+                      0,
+                      fanEntries.findIndex(
+                        (entry) =>
+                          entry.card.id === card.id &&
+                          entry.card.name === card.name
+                      )
+                    )
+                  );
+                }}
+              >
+                <span className="deck-list-qty">{quantity}×</span>
+                <img
+                  src={getCardImage(card, cardFaceMap[card.id] || 0)}
+                  alt=""
+                  onError={(event) =>
+                    repairCardImage(card, event, cardFaceMap[card.id] || 0)
+                  }
+                />
+                <span className="deck-list-name">{card.name}</span>
+                <ManaCostBadges manaCost={card.mana_cost} size="sm" />
+              </button>
+            ))}
           </div>
         </aside>
       </main>
