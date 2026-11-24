@@ -1015,6 +1015,12 @@ export default function App() {
             setIsSearching(false);
             return;
           }
+          if (res.status === 429) {
+            setSearchResults([]);
+            setSearchSource('Scryfall rate limit reached');
+            setIsSearching(false);
+            return;
+          }
           throw new Error(`Scryfall status ${res.status}`);
         }
         const data = await res.json();

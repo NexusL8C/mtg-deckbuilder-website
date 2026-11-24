@@ -818,8 +818,22 @@ app.get('/api/cards/search', async (req, res) => {
     });
 
     if (!response.ok) {
+      if (response.status === 429 && cached) {
+        const retryAfter = response.headers.get('retry-after');
+        return res
+          .set(retryAfter ? { 'Retry-After': retryAfter } : {})
+          .json({
+            source: 'server-cache-stale',
+            query: scryfallQuery,
+            total_cards: cached.data.length,
+            data: cached.data,
+            warning: 'Scryfall is currently rate-limited; showing the last cached result.'
+          });
+      }
       return res.status(response.status).json({
-        error: 'No cards matched your query on Scryfall.',
+        error: response.status === 429
+          ? 'Scryfall is temporarily rate-limited. Please wait and try again.'
+          : 'No cards matched your query on Scryfall.',
         data: []
       });
     }
