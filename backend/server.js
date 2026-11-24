@@ -19,7 +19,24 @@ const app = express();
 const PORT = Number(process.env.PORT || 3001);
 
 // Middleware
-app.use(cors());
+const allowedOrigins = (
+  process.env.FRONTEND_URL ||
+  'http://localhost:5173,http://127.0.0.1:5173'
+)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  }
+}));
 app.use(express.json({ limit: '2mb' }));
 
 // Ensure database schema is initialized on serverless environments (Vercel)
@@ -108,6 +125,32 @@ async function initDatabase() {
       );
     `);
 
+    // Compatibility migration for databases created with an older users schema
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(64);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(120);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS provider VARCHAR(32) DEFAULT 'local';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS provider_id TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    `);
+
+    await client.query(`
+      UPDATE users SET
+        username = COALESCE(username, 'student_demo'),
+        display_name = COALESCE(display_name, 'Student Deckbuilder'),
+        provider = COALESCE(provider, 'local'),
+        provider_id = COALESCE(provider_id, ''),
+        updated_at = COALESCE(updated_at, NOW())
+      WHERE username IS NULL
+         OR display_name IS NULL
+         OR provider IS NULL
+         OR provider_id IS NULL
+         OR updated_at IS NULL;
+    `);
+
     // Table 2: cards (Scryfall Card Cache — Relational Columns + JSONB)
     await client.query(`
       CREATE TABLE IF NOT EXISTS cards (
@@ -183,6 +226,18 @@ async function initDatabase() {
 
     await client.query('COMMIT');
     isDbConnected = true;
+
+    // Seed starter decks after the transaction commits so the demo user FK is visible.
+    const starterDeckCount = await pool.query(
+      'SELECT COUNT(*)::int AS count FROM decks'
+    );
+    if (starterDeckCount.rows[0].count === 0) {
+      const starterDecks = readDecksFromDisk();
+      for (const starterDeck of starterDecks) {
+        await saveDeckToPostgres(starterDeck, DEMO_USER_ID);
+      }
+    }
+
     console.log('✅ PostgreSQL Schema initialized on Neon: users, cards, decks, deck_cards ready!');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -201,6 +256,7 @@ const DECKS_FILE = path.join(DATA_DIR, 'decks.json');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
+ensureFallbackStarterDecks();
 
 function readDecksFromDisk() {
   try {
@@ -218,6 +274,57 @@ function readDecksFromDisk() {
 
 function writeDecksToDisk(decks) {
   fs.writeFileSync(DECKS_FILE, JSON.stringify(decks, null, 2));
+}
+
+function ensureFallbackStarterDecks() {
+  const existing = readDecksFromDisk();
+  if (existing.length > 0) return existing;
+
+  const card = (id, name, typeLine, cmc, colorIdentity, oracleText = '') => ({
+    id,
+    name,
+    type_line: typeLine,
+    cmc,
+    color_identity: colorIdentity,
+    oracle_text: oracleText,
+    mana_cost: '',
+    image_uris: {},
+    prices: { usd: '0', eur: '0' },
+    legalities: { commander: 'legal', modern: 'legal', standard: 'legal' }
+  });
+
+  const niv = card('starter-niv', 'Niv-Mizzet, Parun', 'Legendary Creature — Dragon Wizard', 6, ['U', 'R']);
+  const bolt = card('starter-bolt', 'Lightning Bolt', 'Instant', 1, ['R']);
+  const island = card('starter-island', 'Island', 'Basic Land — Island', 0, []);
+  const mountain = card('starter-mountain', 'Mountain', 'Basic Land — Mountain', 0, []);
+
+  const starters = [
+    {
+      id: 'deck-izzet-commander',
+      name: 'Izzet Spellslinger',
+      format: 'commander',
+      description: 'Starter Commander deck.',
+      entries: [
+        { card: niv, quantity: 1, zone: 'commander' },
+        { card: bolt, quantity: 36, zone: 'mainboard' },
+        { card: island, quantity: 31, zone: 'mainboard' },
+        { card: mountain, quantity: 32, zone: 'mainboard' }
+      ]
+    },
+    {
+      id: 'deck-modern-burn',
+      name: 'Modern Burn',
+      format: 'modern',
+      description: 'Starter Modern deck.',
+      entries: [
+        { card: bolt, quantity: 4, zone: 'mainboard' },
+        { card: mountain, quantity: 56, zone: 'mainboard' }
+      ]
+    }
+  ];
+
+  writeDecksToDisk(starters);
+  return starters;
 }
 
 // ============================================================================
@@ -410,6 +517,202 @@ const BASIC_LANDS = new Set([
   'Snow-Covered Mountain', 'Snow-Covered Forest'
 ]);
 
+function getPrimaryCategory(typeLine = '') {
+  const type = typeLine.toLowerCase();
+  if (type.includes('creature')) return 'Creatures';
+  if (type.includes('planeswalker')) return 'Planeswalkers';
+  if (type.includes('instant') || type.includes('sorcery')) return 'Instants & Sorceries';
+  if (type.includes('land')) return 'Lands';
+  return 'Artifacts & Enchantments';
+}
+
+function buildValidation(deck) {
+  const checks = [];
+  const entries = deck.entries || [];
+  const format = deck.format || 'commander';
+  const commanderEntries = entries.filter((entry) => entry.zone === 'commander');
+  const mainboardEntries = entries.filter((entry) => entry.zone === 'mainboard');
+  const sideboardEntries = entries.filter((entry) => entry.zone === 'sideboard');
+  const commanderCount = commanderEntries.reduce((sum, entry) => sum + entry.quantity, 0);
+  const mainCount = mainboardEntries.reduce((sum, entry) => sum + entry.quantity, 0);
+  const sideCount = sideboardEntries.reduce((sum, entry) => sum + entry.quantity, 0);
+  const totalMainAndCommander = commanderCount + mainCount;
+
+  if (format === 'commander') {
+    checks.push({
+      id: 'commander-slot',
+      title: 'Commander Designated (1 Legendary)',
+      status: commanderCount === 1 ? 'pass' : 'fail',
+      detail: commanderCount === 1
+        ? `Commander: ${commanderEntries[0].card.name}`
+        : `Found ${commanderCount} cards in Commander zone (requires 1).`
+    });
+    checks.push({
+      id: 'deck-size',
+      title: '100-Card Deck Size Requirement',
+      status: totalMainAndCommander === 100 ? 'pass' : 'warn',
+      detail: `${totalMainAndCommander} / 100 cards.`
+    });
+  } else {
+    checks.push({
+      id: 'deck-size',
+      title: 'Minimum 60 Mainboard Cards',
+      status: mainCount >= 60 ? 'pass' : 'fail',
+      detail: `${mainCount} / 60 Mainboard cards.`
+    });
+    checks.push({
+      id: 'sideboard-size',
+      title: 'Maximum 15 Sideboard Cards',
+      status: sideCount <= 15 ? 'pass' : 'fail',
+      detail: `${sideCount} / 15 Sideboard cards.`
+    });
+  }
+
+  const copyLimit = format === 'commander' ? 1 : 4;
+  const countsByName = {};
+  entries.forEach((entry) => {
+    countsByName[entry.card.name] = (countsByName[entry.card.name] || 0) + entry.quantity;
+  });
+  const copyViolations = Object.entries(countsByName).filter(
+    ([name, quantity]) => !BASIC_LANDS.has(name) && quantity > copyLimit
+  );
+  checks.push({
+    id: 'copy-limit',
+    title: format === 'commander' ? 'Singleton Rule (Max 1 Copy)' : '4-Copy Playset Rule (Max 4 Copies)',
+    status: copyViolations.length === 0 ? 'pass' : 'fail',
+    detail: copyViolations.length === 0
+      ? `All non-basic cards obey the ${copyLimit}-copy limit.`
+      : `Violations: ${copyViolations.map(([name, quantity]) => `${name} (${quantity}x)`).join(', ')}`
+  });
+
+  if (format === 'commander') {
+    const identity = new Set(commanderEntries[0]?.card?.color_identity || []);
+    const violations = entries.flatMap((entry) =>
+      (entry.card.color_identity || [])
+        .filter((color) => !identity.has(color))
+        .length > 0
+        ? [`${entry.card.name} [${(entry.card.color_identity || []).join('')}]`]
+        : []
+    );
+    checks.push({
+      id: 'color-identity',
+      title: `Commander Color Identity (${Array.from(identity).join('') || 'C'})`,
+      status: commanderCount === 0 ? 'warn' : violations.length === 0 ? 'pass' : 'fail',
+      detail: commanderCount === 0
+        ? 'Select a Commander to validate color identity.'
+        : violations.length === 0
+          ? "All cards match your Commander's color identity."
+          : `Off-color cards: ${violations.join(', ')}`
+    });
+  }
+
+  const illegalCards = entries.flatMap((entry) => {
+    const legality = entry.card.legalities?.[format];
+    return legality && legality !== 'legal' && legality !== 'restricted'
+      ? [`${entry.card.name} (${legality.replace('_', ' ')})`]
+      : [];
+  });
+  checks.push({
+    id: 'format-banlist',
+    title: `Official ${format.toUpperCase()} Format Legality`,
+    status: illegalCards.length === 0 ? 'pass' : 'fail',
+    detail: illegalCards.length === 0
+      ? `Every card is legal in ${format.toUpperCase()}.`
+      : `Illegal/Banned: ${illegalCards.slice(0, 4).join(', ')}${illegalCards.length > 4 ? ` +${illegalCards.length - 4} more` : ''}`
+  });
+
+  const hasFail = checks.some((check) => check.status === 'fail');
+  const hasWarn = checks.some((check) => check.status === 'warn');
+  return {
+    overall: hasFail ? 'illegal' : hasWarn ? 'incomplete' : 'legal',
+    checks,
+    counts: { commanderCount, mainCount, sideCount, totalMainAndCommander }
+  };
+}
+
+function buildAnalytics(deck) {
+  const curveBins = [
+    { cmc: '0', count: 0 }, { cmc: '1', count: 0 }, { cmc: '2', count: 0 },
+    { cmc: '3', count: 0 }, { cmc: '4', count: 0 }, { cmc: '5', count: 0 },
+    { cmc: '6+', count: 0 }
+  ];
+  const colorCounts = { W: 0, U: 0, B: 0, R: 0, G: 0, C: 0 };
+  const typeCounts = {
+    Creatures: 0,
+    'Instants & Sorceries': 0,
+    'Artifacts & Enchantments': 0,
+    Planeswalkers: 0,
+    Lands: 0
+  };
+  let totalEur = 0;
+  let totalUsd = 0;
+  let totalNonLandCmc = 0;
+  let totalNonLandCards = 0;
+
+  for (const entry of deck.entries || []) {
+    const { card, quantity, zone } = entry;
+    totalEur += (parseFloat(card.prices?.eur || '0') || 0) * quantity;
+    totalUsd += (parseFloat(card.prices?.usd || '0') || 0) * quantity;
+    if (zone === 'sideboard') continue;
+
+    const category = getPrimaryCategory(card.type_line);
+    if (typeCounts[category] !== undefined) typeCounts[category] += quantity;
+    const isLand = (card.type_line || '').toLowerCase().includes('land');
+    if (!isLand) {
+      const cmc = Math.floor(Number(card.cmc) || 0);
+      totalNonLandCmc += cmc * quantity;
+      totalNonLandCards += quantity;
+      curveBins[cmc >= 6 ? 6 : cmc].count += quantity;
+    }
+
+    const identity = card.color_identity || [];
+    if (identity.length === 0 && !isLand) colorCounts.C += quantity;
+    else identity.forEach((color) => {
+      if (colorCounts[color] !== undefined) colorCounts[color] += quantity;
+    });
+  }
+
+  const manaColors = [
+    { name: 'White', code: 'W', accent: '#f8fafc' },
+    { name: 'Blue', code: 'U', accent: '#38bdf8' },
+    { name: 'Black', code: 'B', accent: '#64748b' },
+    { name: 'Red', code: 'R', accent: '#fb7185' },
+    { name: 'Green', code: 'G', accent: '#4ade80' },
+    { name: 'Colorless', code: 'C', accent: '#94a3b8' }
+  ];
+  const colorPieData = manaColors
+    .map((color) => ({ ...color, value: colorCounts[color.code] || 0 }))
+    .filter((color) => color.value > 0);
+
+  return {
+    curveBins,
+    colorPieData,
+    typeCounts,
+    totalEur: totalEur.toFixed(2),
+    totalUsd: totalUsd.toFixed(2),
+    avgCmc: totalNonLandCards > 0 ? (totalNonLandCmc / totalNonLandCards).toFixed(2) : '0.00'
+  };
+}
+
+function buildArenaExport(deck) {
+  const lines = [];
+  const commanders = deck.entries.filter((entry) => entry.zone === 'commander');
+  const mainboard = deck.entries.filter((entry) => entry.zone === 'mainboard');
+  const sideboard = deck.entries.filter((entry) => entry.zone === 'sideboard');
+  if (commanders.length > 0) {
+    lines.push('Commander');
+    commanders.forEach((entry) => lines.push(`${entry.quantity} ${entry.card.name}`));
+    lines.push('');
+  }
+  lines.push('Deck');
+  mainboard.forEach((entry) => lines.push(`${entry.quantity} ${entry.card.name}`));
+  if (sideboard.length > 0) {
+    lines.push('', 'Sideboard');
+    sideboard.forEach((entry) => lines.push(`${entry.quantity} ${entry.card.name}`));
+  }
+  return lines.join('\n');
+}
+
 // ============================================================================
 // 6. CORE API ENDPOINTS
 // ============================================================================
@@ -434,7 +737,7 @@ app.get('/', (_req, res) => {
 
 // Health check & database metrics endpoint
 app.get('/api/health', async (_req, res) => {
-  if (pool) {
+  if (pool && isDbConnected) {
     try {
       const client = await pool.connect();
       try {
@@ -527,8 +830,22 @@ app.get('/api/cards/search', async (req, res) => {
     });
 
     if (!response.ok) {
+      if (response.status === 429 && cached) {
+        const retryAfter = response.headers.get('retry-after');
+        return res
+          .set(retryAfter ? { 'Retry-After': retryAfter } : {})
+          .json({
+            source: 'server-cache-stale',
+            query: scryfallQuery,
+            total_cards: cached.data.length,
+            data: cached.data,
+            warning: 'Scryfall is currently rate-limited; showing the last cached result.'
+          });
+      }
       return res.status(response.status).json({
-        error: 'No cards matched your query on Scryfall.',
+        error: response.status === 429
+          ? 'Scryfall is temporarily rate-limited. Please wait and try again.'
+          : 'No cards matched your query on Scryfall.',
         data: []
       });
     }
@@ -559,7 +876,7 @@ app.get('/api/cards/search', async (req, res) => {
 // GET all decks
 app.get('/api/decks', async (_req, res) => {
   try {
-    if (pool) {
+    if (pool && isDbConnected) {
       const decks = await readDecksFromPostgres();
       return res.json(decks);
     }
@@ -574,7 +891,7 @@ app.get('/api/decks', async (_req, res) => {
 // GET single deck by ID
 app.get('/api/decks/:id', async (req, res) => {
   try {
-    if (pool) {
+    if (pool && isDbConnected) {
       const decks = await readDecksFromPostgres();
       const deck = decks.find((d) => d.id === req.params.id);
       if (!deck) return res.status(404).json({ error: 'Deck not found' });
@@ -599,7 +916,7 @@ app.put('/api/decks/:id', async (req, res) => {
   }
 
   try {
-    if (pool) {
+    if (pool && isDbConnected) {
       await saveDeckToPostgres(deck, DEMO_USER_ID);
       return res.status(204).end();
     }
@@ -648,7 +965,7 @@ app.post('/api/decks', async (req, res) => {
   };
 
   try {
-    if (pool) {
+    if (pool && isDbConnected) {
       const saved = await saveDeckToPostgres(deckToSave, DEMO_USER_ID);
       return res.status(201).json(saved);
     }
@@ -671,7 +988,7 @@ app.post('/api/decks', async (req, res) => {
 // DELETE a deck
 app.delete('/api/decks/:id', async (req, res) => {
   try {
-    if (pool) {
+    if (pool && isDbConnected) {
       const deleted = await deleteDeckFromPostgres(req.params.id);
       if (!deleted) {
         return res.status(404).json({ error: 'Deck not found' });
@@ -686,6 +1003,220 @@ app.delete('/api/decks/:id', async (req, res) => {
   } catch (error) {
     console.error('Failed to delete deck:', error);
     res.status(500).json({ error: 'Failed to delete deck' });
+  }
+});
+
+// Server-owned deck view: validation, analytics, grouping, and export.
+app.get('/api/decks/:id/view', async (req, res) => {
+  try {
+    const decks = pool && isDbConnected
+      ? await readDecksFromPostgres(DEMO_USER_ID)
+      : readDecksFromDisk();
+    const deck = decks.find((item) => item.id === req.params.id);
+    if (!deck) return res.status(404).json({ error: 'Deck not found' });
+
+    return res.json({
+      deck,
+      validation: buildValidation(deck),
+      analytics: buildAnalytics(deck),
+      arenaExport: buildArenaExport(deck)
+    });
+  } catch (error) {
+    console.error('Failed to build deck view:', error);
+    res.status(500).json({ error: 'Failed to build deck view' });
+  }
+});
+
+async function resolveScryfallCard(name) {
+  const response = await fetch(
+    `https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(name)}`,
+    { headers: { 'User-Agent': 'ArcaneForge-SchoolProject/1.0', Accept: 'application/json' } }
+  );
+  if (!response.ok) return null;
+  return response.json();
+}
+
+// Server-owned deck mutations.
+app.patch('/api/decks/:id', async (req, res) => {
+  try {
+    const allDecks = pool && isDbConnected
+      ? await readDecksFromPostgres(DEMO_USER_ID)
+      : readDecksFromDisk();
+    const deck = allDecks.find((item) => item.id === req.params.id);
+    if (!deck) return res.status(404).json({ error: 'Deck not found' });
+
+    const { action, card, cardName, zone, fromZone, toZone, delta, format, text, name } = req.body;
+
+    if (action === 'set-name') {
+      if (!String(name || '').trim()) return res.status(400).json({ error: 'Deck name is required' });
+      deck.name = String(name).trim();
+    } else if (action === 'set-format') {
+      deck.format = format;
+      deck.entries = deck.entries.map((entry) =>
+        format !== 'commander' && entry.zone === 'commander'
+          ? { ...entry, zone: 'mainboard' }
+          : entry
+      );
+    } else if (action === 'add-card') {
+      if (zone === 'commander') {
+        deck.entries = [
+          ...deck.entries.filter((entry) => entry.zone !== 'commander'),
+          { card, quantity: 1, zone: 'commander' }
+        ];
+      } else {
+        const existing = deck.entries.find((entry) =>
+          entry.card.name === card.name && entry.zone === zone
+        );
+        if (existing) existing.quantity += 1;
+        else deck.entries.push({ card, quantity: 1, zone: zone || 'mainboard' });
+      }
+    } else if (action === 'change-quantity') {
+      deck.entries = deck.entries
+        .map((entry) => entry.card.name === cardName && entry.zone === zone
+          ? { ...entry, quantity: entry.quantity + delta }
+          : entry
+        )
+        .filter((entry) => entry.quantity > 0);
+    } else if (action === 'move-card') {
+      const sourceIndex = deck.entries.findIndex((entry) =>
+        entry.card.name === cardName && entry.zone === fromZone
+      );
+      if (sourceIndex !== -1) {
+        const source = deck.entries[sourceIndex];
+        deck.entries.splice(sourceIndex, 1);
+        if (toZone === 'commander') {
+          deck.entries = deck.entries.map((entry) =>
+            entry.zone === 'commander' ? { ...entry, zone: 'mainboard' } : entry
+          );
+          deck.entries.unshift({ card: source.card, quantity: 1, zone: 'commander' });
+        } else {
+          const target = deck.entries.find((entry) =>
+            entry.card.name === cardName && entry.zone === toZone
+          );
+          if (target) target.quantity += source.quantity;
+          else deck.entries.push({ ...source, zone: toZone });
+        }
+      }
+    } else if (action === 'import-arena') {
+      const parseResponse = await resolveArenaText(text);
+      deck.entries = parseResponse.entries;
+    } else {
+      return res.status(400).json({ error: 'Unknown deck action' });
+    }
+
+    if (pool && isDbConnected) await saveDeckToPostgres(deck, DEMO_USER_ID);
+    else {
+      const index = allDecks.findIndex((item) => item.id === deck.id);
+      allDecks[index] = deck;
+      writeDecksToDisk(allDecks);
+    }
+
+    return res.json({
+      deck,
+      validation: buildValidation(deck),
+      analytics: buildAnalytics(deck),
+      arenaExport: buildArenaExport(deck)
+    });
+  } catch (error) {
+    console.error('Failed to mutate deck:', error);
+    res.status(500).json({ error: 'Failed to mutate deck' });
+  }
+});
+
+async function resolveArenaText(text) {
+  const entries = [];
+  let zone = 'mainboard';
+  for (const rawLine of String(text).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+    const lower = rawLine.toLowerCase();
+    if (/^commander:?$/.test(lower) || /^command zone:?$/.test(lower)) {
+      zone = 'commander';
+      continue;
+    }
+    if (/^sideboard:?$/.test(lower)) {
+      zone = 'sideboard';
+      continue;
+    }
+    if (/^deck:?$/.test(lower) || /^mainboard:?$/.test(lower)) {
+      zone = 'mainboard';
+      continue;
+    }
+
+    const match = rawLine.match(/^(\d+)x?\s+([^(]+?)(?:\s+\([A-Z0-9]+\)\s*\d*)?$/i);
+    if (!match) continue;
+    const quantity = parseInt(match[1], 10);
+    const name = match[2].trim();
+    const card = await resolveScryfallCard(name);
+    if (card) entries.push({ card, quantity, zone });
+  }
+  return { entries };
+}
+
+app.post('/api/decks/:id/playtest/opening-hand', (req, res) => {
+  const mulligans = Math.max(0, Math.min(7, Number(req.body.mulligans) || 0));
+  res.status(501).json({ error: 'Use POST /api/decks/:id/playtest for server-side playtest state' });
+});
+
+app.post('/api/decks/:id/playtest', async (req, res) => {
+  try {
+    const decks = pool && isDbConnected
+      ? await readDecksFromPostgres(DEMO_USER_ID)
+      : readDecksFromDisk();
+    const deck = decks.find((item) => item.id === req.params.id);
+    if (!deck) return res.status(404).json({ error: 'Deck not found' });
+
+    const mulligans = Math.max(0, Math.min(7, Number(req.body.mulligans) || 0));
+    const poolCards = [];
+    deck.entries.forEach((entry) => {
+      if (entry.zone === 'mainboard') {
+        for (let index = 0; index < entry.quantity; index++) poolCards.push(entry.card);
+      }
+    });
+    for (let index = poolCards.length - 1; index > 0; index--) {
+      const randomIndex = Math.floor(Math.random() * (index + 1));
+      [poolCards[index], poolCards[randomIndex]] = [poolCards[randomIndex], poolCards[index]];
+    }
+    const drawCount = Math.max(1, 7 - mulligans);
+    res.json({
+      hand: poolCards.slice(0, drawCount),
+      library: poolCards.slice(drawCount),
+      mulliganCount: mulligans
+    });
+  } catch (error) {
+    console.error('Failed to create playtest hand:', error);
+    res.status(500).json({ error: 'Failed to create playtest hand' });
+  }
+});
+
+app.get('/api/cards/named', async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Card name is required' });
+  try {
+    const card = await resolveScryfallCard(name);
+    if (!card) return res.status(404).json({ error: 'Card not found' });
+    res.json(card);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to resolve card', details: error.message });
+  }
+});
+
+app.post('/api/decks/demo/reset', async (req, res) => {
+  try {
+    const starterDecks = readDecksFromDisk();
+    if (pool && isDbConnected) {
+      await pool.query('DELETE FROM decks');
+      for (const deck of starterDecks) {
+        await saveDeckToPostgres(deck, DEMO_USER_ID);
+      }
+    } else {
+      writeDecksToDisk(starterDecks);
+    }
+    const decks = pool && isDbConnected
+      ? await readDecksFromPostgres(DEMO_USER_ID)
+      : starterDecks;
+    res.json({ decks });
+  } catch (error) {
+    console.error('Failed to reset demo decks:', error);
+    res.status(500).json({ error: 'Failed to reset demo decks' });
   }
 });
 
