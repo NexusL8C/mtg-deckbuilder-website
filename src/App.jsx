@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { apiUrl } from './api';
 import {
   Search,
   Plus,
@@ -735,170 +736,42 @@ const INITIAL_DECKS = [
   }
 ];
 
-const STORAGE_KEY = 'arcaneforge_mtg_decks_v1';
-
-// ============================================================================
-// 3. REAL-TIME LEGALITY & RULES VALIDATION ENGINE
-// ============================================================================
-
-function validateDeck(deck) {
-  const format = deck.format; // 'commander' | 'standard' | 'modern'
-  const checks = [];
-  const commanderEntries = deck.entries.filter((e) => e.zone === 'commander');
-  const mainboardEntries = deck.entries.filter((e) => e.zone === 'mainboard');
-  const sideboardEntries = deck.entries.filter((e) => e.zone === 'sideboard');
-
-  const commanderCount = commanderEntries.reduce((acc, e) => acc + e.quantity, 0);
-  const mainCount = mainboardEntries.reduce((acc, e) => acc + e.quantity, 0);
-  const sideCount = sideboardEntries.reduce((acc, e) => acc + e.quantity, 0);
-  const totalMainAndCommander = commanderCount + mainCount;
-
-  // 1. Format Deck Size Check
-  if (format === 'commander') {
-    const hasCommander = commanderCount === 1;
-    checks.push({
-      id: 'commander-slot',
-      title: 'Commander Designated (1 Legendary)',
-      status: hasCommander ? 'pass' : 'fail',
-      detail: hasCommander
-        ? `Commander: ${commanderEntries[0].card.name}`
-        : `Found ${commanderCount} cards in Commander zone (requires 1).`
-    });
-
-    const is100 = totalMainAndCommander === 100;
-    checks.push({
-      id: 'deck-size',
-      title: '100-Card Deck Size Requirement',
-      status: is100 ? 'pass' : 'warn',
-      detail: `${totalMainAndCommander} / 100 cards (${100 - totalMainAndCommander > 0 ? `${100 - totalMainAndCommander} more needed` : is100 ? 'Exact 100 reached' : `${totalMainAndCommander - 100} over limit`}).`
-    });
-  } else {
-    const meets60 = mainCount >= 60;
-    checks.push({
-      id: 'deck-size',
-      title: 'Minimum 60 Mainboard Cards',
-      status: meets60 ? 'pass' : 'fail',
-      detail: `${mainCount} / 60 Mainboard cards.`
-    });
-
-    const meetsSide = sideCount <= 15;
-    checks.push({
-      id: 'sideboard-size',
-      title: 'Maximum 15 Sideboard Cards',
-      status: meetsSide ? 'pass' : 'fail',
-      detail: `${sideCount} / 15 Sideboard cards.`
-    });
-  }
-
-  // 2. Copy Limit Check (Singleton vs 4-of)
-  const copyLimit = format === 'commander' ? 1 : 4;
-  const countByCardName = {};
-  deck.entries.forEach((entry) => {
-    if (format !== 'commander' && entry.zone === 'commander') return;
-    countByCardName[entry.card.name] = (countByCardName[entry.card.name] || 0) + entry.quantity;
-  });
-
-  const copyViolations = Object.entries(countByCardName).filter(
-    ([name, qty]) => !BASIC_LAND_NAMES.has(name) && qty > copyLimit
-  );
-
-  checks.push({
-    id: 'copy-limit',
-    title: format === 'commander' ? 'Singleton Rule (Max 1 Copy)' : '4-Copy Playset Rule (Max 4 Copies)',
-    status: copyViolations.length === 0 ? 'pass' : 'fail',
-    detail:
-      copyViolations.length === 0
-        ? `All non-basic cards obey the ${copyLimit}-copy limit.`
-        : `Violations: ${copyViolations.map(([n, q]) => `${n} (${q}x)`).join(', ')}`
-  });
-
-  // 3. Commander Color Identity Check
-  if (format === 'commander') {
-    const cmdrIdentity = new Set(commanderEntries[0]?.card?.color_identity || []);
-    const identityViolations = [];
-    deck.entries.forEach((entry) => {
-      const cardColors = entry.card.color_identity || [];
-      const outside = cardColors.filter((c) => !cmdrIdentity.has(c));
-      if (outside.length > 0) {
-        identityViolations.push(`${entry.card.name} [${outside.join('')}]`);
-      }
-    });
-
-    checks.push({
-      id: 'color-identity',
-      title: `Commander Color Identity (${Array.from(cmdrIdentity).join('') || 'C'})`,
-      status: commanderCount === 0 ? 'warn' : identityViolations.length === 0 ? 'pass' : 'fail',
-      detail:
-        commanderCount === 0
-          ? 'Select a Commander to validate color identity.'
-          : identityViolations.length === 0
-          ? 'All cards match your Commander\'s color identity.'
-          : `Off-color cards: ${identityViolations.join(', ')}`
-    });
-  }
-
-  // 4. Scryfall Format Legality Check
-  const illegalCards = [];
-  deck.entries.forEach((entry) => {
-    const leg = entry.card.legalities?.[format];
-    if (leg && leg !== 'legal' && leg !== 'restricted') {
-      illegalCards.push(`${entry.card.name} (${leg.replace('_', ' ')})`);
-    }
-  });
-
-  checks.push({
-    id: 'format-banlist',
-    title: `Official ${format.toUpperCase()} Format Legality`,
-    status: illegalCards.length === 0 ? 'pass' : 'fail',
-    detail:
-      illegalCards.length === 0
-        ? `Every card is legal in ${format.toUpperCase()}.`
-        : `Illegal/Banned: ${illegalCards.slice(0, 4).join(', ')}${illegalCards.length > 4 ? ` +${illegalCards.length - 4} more` : ''}`
-  });
-
-  const hasFail = checks.some((c) => c.status === 'fail');
-  const hasWarn = checks.some((c) => c.status === 'warn');
-
-  return {
-    overall: hasFail ? 'illegal' : hasWarn ? 'incomplete' : 'legal',
-    checks,
-    counts: {
-      commanderCount,
-      mainCount,
-      sideCount,
-      totalMainAndCommander
-    }
-  };
-}
-
 // ============================================================================
 // 4. MAIN APPLICATION COMPONENT
 // ============================================================================
 
 export default function App() {
   // --- Persistent Decks State ---
-  const [decks, setDecks] = useState(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {
-      console.error('Failed to read decks from localStorage:', e);
-    }
-    return INITIAL_DECKS;
-  });
+  const [decks, setDecks] = useState([]);
   const [persistenceReady, setPersistenceReady] = useState(false);
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
 
-  const [activeDeckId, setActiveDeckId] = useState(() => decks[0]?.id || INITIAL_DECKS[0].id);
+  const [activeDeckId, setActiveDeckId] = useState('');
+  const [serverDeckView, setServerDeckView] = useState(null);
+
+  useEffect(() => {
+    if (!activeDeckId) return;
+    let cancelled = false;
+    fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeckId)}/view`))
+      .then((response) => response.ok ? response.json() : null)
+      .then((view) => {
+        if (!view || cancelled) return;
+        setServerDeckView(view);
+        setDecks((current) =>
+          current.map((deck) => deck.id === view.deck.id ? view.deck : deck)
+        );
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [activeDeckId]);
 
   useEffect(() => {
     let cancelled = false;
 
-    fetch('/api/me')
+    fetch(apiUrl('/api/me'))
       .then((response) => {
         if (!response.ok) throw new Error(`Auth API returned ${response.status}`);
         return response.json();
@@ -908,7 +781,7 @@ export default function App() {
         setUser(currentUser);
         if (!currentUser) return;
 
-        return fetch('/api/decks')
+        return fetch(apiUrl('/api/decks'))
           .then((response) => {
             if (!response.ok) throw new Error(`Deck API returned ${response.status}`);
             return response.json();
@@ -942,40 +815,13 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(decks));
-    } catch (e) {
-      console.error('Failed to save decks to localStorage:', e);
-    }
-  }, [decks]);
-
-  useEffect(() => {
-    if (!persistenceReady || !user) return;
-
-    const saveToDatabase = async () => {
-      for (const deck of decks) {
-        try {
-          const response = await fetch(`/api/decks/${encodeURIComponent(deck.id)}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(deck)
-          });
-          if (!response.ok) {
-            throw new Error(`Deck API returned ${response.status}`);
-          }
-        } catch (error) {
-          console.warn(`Could not save "${deck.name}" to the database:`, error);
-          return;
-        }
-      }
-    };
-
-    saveToDatabase();
-  }, [decks, persistenceReady, user]);
-
   const activeDeck = useMemo(
-    () => decks.find((d) => d.id === activeDeckId) || decks[0],
+    () => decks.find((d) => d.id === activeDeckId) || decks[0] || {
+      id: '',
+      name: 'Loading deck...',
+      format: 'commander',
+      entries: []
+    },
     [decks, activeDeckId]
   );
 
@@ -1037,7 +883,7 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedColors, setSelectedColors] = useState([]);
   const [selectedType, setSelectedType] = useState('All');
-  const [searchResults, setSearchResults] = useState(PRELOADED_CARDS);
+  const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
   const [searchSource, setSearchSource] = useState('Starter Cache (Ready)');
   const [cardFaceMap, setCardFaceMap] = useState({}); // cardId -> 0 | 1 for double-faced cards
@@ -1058,7 +904,7 @@ export default function App() {
   });
 
   // --- Inspector & Workspace UI State ---
-  const [inspectedCard, setInspectedCard] = useState(PRELOADED_CARDS[0]);
+  const [inspectedCard, setInspectedCard] = useState(null);
   const [rightTab, setRightTab] = useState('analytics'); // 'analytics' | 'rules' | 'inspector'
   const [toast, setToast] = useState(null);
 
@@ -1105,7 +951,7 @@ export default function App() {
 
     try {
       const response = await fetch(
-        `https://api.scryfall.com/cards/named?exact=${encodeURIComponent(card.name)}`
+        apiUrl(`/api/cards/named?name=${encodeURIComponent(card.name)}`)
       );
       if (!response.ok) throw new Error(`Scryfall image lookup failed: ${response.status}`);
 
@@ -1157,10 +1003,9 @@ export default function App() {
         }
       }
 
-      const finalQuery = encodeURIComponent(queryParts.join(' '));
       try {
         const res = await fetch(
-          `https://api.scryfall.com/cards/search?q=${finalQuery}&order=edhrec`,
+          apiUrl(`/api/cards/search?q=${encodeURIComponent(queryParts.join(' '))}`),
           { signal: controller.signal }
         );
         if (!res.ok) {
@@ -1177,27 +1022,8 @@ export default function App() {
         setSearchSource(`Live Scryfall API (${data.total_cards || 0} matches)`);
       } catch (err) {
         if (err.name === 'AbortError') return;
-        // Fallback to filtering local preloaded cache
-        const localFiltered = PRELOADED_CARDS.filter((card) => {
-          const matchesText =
-            !trimmed ||
-            card.name.toLowerCase().includes(trimmed.toLowerCase()) ||
-            (card.oracle_text || '').toLowerCase().includes(trimmed.toLowerCase()) ||
-            (card.type_line || '').toLowerCase().includes(trimmed.toLowerCase());
-          const matchesType =
-            selectedType === 'All' ||
-            (card.type_line || '').toLowerCase().includes(selectedType.toLowerCase());
-          const matchesColor =
-            selectedColors.length === 0 ||
-            selectedColors.every((c) =>
-              c === 'C'
-                ? (card.color_identity || []).length === 0
-                : (card.color_identity || []).includes(c)
-            );
-          return matchesText && matchesType && matchesColor;
-        });
-        setSearchResults(localFiltered);
-        setSearchSource('Offline Fallback Cache');
+        setSearchResults([]);
+        setSearchSource('Card API unavailable');
       } finally {
         setIsSearching(false);
       }
@@ -1210,42 +1036,23 @@ export default function App() {
   }, [searchQuery, selectedColors, selectedType]);
 
   // --- Deck Manipulation Actions ---
-  const updateActiveDeck = useCallback(
-    (updater) => {
-      setDecks((prev) =>
-        prev.map((deck) => (deck.id === activeDeck.id ? updater(deck) : deck))
-      );
-    },
-    [activeDeck.id]
-  );
-
   const addCardToDeck = useCallback(
     (card, zone = 'mainboard') => {
       setInspectedCard(card);
       setShowInspector(true);
-      updateActiveDeck((deck) => {
-        let nextEntries = [...deck.entries];
-
-        // If setting as Commander, replace existing commander or move to commander zone
-        if (zone === 'commander') {
-          nextEntries = nextEntries.filter((e) => e.zone !== 'commander');
-          nextEntries.unshift({ card, quantity: 1, zone: 'commander' });
-          return { ...deck, entries: nextEntries };
-        }
-
-        const existingIndex = nextEntries.findIndex(
-          (e) => e.card.name === card.name && e.zone === zone
-        );
-
-        if (existingIndex > -1) {
-          const current = nextEntries[existingIndex];
-          nextEntries[existingIndex] = { ...current, quantity: current.quantity + 1 };
-        } else {
-          nextEntries.push({ card, quantity: 1, zone });
-        }
-
-        return { ...deck, entries: nextEntries };
-      });
+      fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}`), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add-card', card, zone })
+      })
+        .then((response) => response.ok ? response.json() : null)
+        .then((view) => {
+          if (!view) return;
+          setServerDeckView(view);
+          setDecks((current) =>
+            current.map((deck) => deck.id === view.deck.id ? view.deck : deck)
+          );
+        });
 
       triggerToast(
         zone === 'commander'
@@ -1253,104 +1060,96 @@ export default function App() {
           : `Added 1x ${card.name} to ${zone === 'sideboard' ? 'Sideboard' : 'Mainboard'}`
       );
     },
-    [updateActiveDeck, triggerToast]
+    [activeDeck.id, triggerToast]
   );
 
   const changeCardQuantity = useCallback(
     (cardName, zone, delta) => {
-      updateActiveDeck((deck) => {
-        const nextEntries = deck.entries
-          .map((entry) => {
-            if (entry.card.name === cardName && entry.zone === zone) {
-              const newQty = entry.quantity + delta;
-              return newQty > 0 ? { ...entry, quantity: newQty } : null;
-            }
-            return entry;
-          })
-          .filter(Boolean);
-        return { ...deck, entries: nextEntries };
-      });
+      fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}`), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'change-quantity', cardName, zone, delta })
+      })
+        .then((response) => response.ok ? response.json() : null)
+        .then((view) => {
+          if (!view) return;
+          setServerDeckView(view);
+          setDecks((current) =>
+            current.map((deck) => deck.id === view.deck.id ? view.deck : deck)
+          );
+        });
     },
-    [updateActiveDeck]
+    [activeDeck.id]
   );
 
   const moveCardZone = useCallback(
     (card, fromZone, toZone) => {
-      updateActiveDeck((deck) => {
-        let nextEntries = [...deck.entries];
-        const sourceIdx = nextEntries.findIndex(
-          (e) => e.card.name === card.name && e.zone === fromZone
-        );
-        if (sourceIdx === -1) return deck;
-
-        const sourceEntry = nextEntries[sourceIdx];
-        nextEntries.splice(sourceIdx, 1);
-
-        if (toZone === 'commander') {
-          // Move any existing commander to mainboard
-          nextEntries = nextEntries.map((e) =>
-            e.zone === 'commander' ? { ...e, zone: 'mainboard' } : e
+      fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}`), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'move-card', cardName: card.name, fromZone, toZone })
+      })
+        .then((response) => response.ok ? response.json() : null)
+        .then((view) => {
+          if (!view) return;
+          setServerDeckView(view);
+          setDecks((current) =>
+            current.map((deck) => deck.id === view.deck.id ? view.deck : deck)
           );
-          nextEntries.unshift({ card, quantity: 1, zone: 'commander' });
-        } else {
-          const targetIdx = nextEntries.findIndex(
-            (e) => e.card.name === card.name && e.zone === toZone
-          );
-          if (targetIdx > -1) {
-            nextEntries[targetIdx] = {
-              ...nextEntries[targetIdx],
-              quantity: nextEntries[targetIdx].quantity + sourceEntry.quantity
-            };
-          } else {
-            nextEntries.push({ ...sourceEntry, zone: toZone });
-          }
-        }
-        return { ...deck, entries: nextEntries };
-      });
+        });
       triggerToast(`Moved ${card.name} to ${toZone}`);
     },
-    [updateActiveDeck, triggerToast]
+    [activeDeck.id, triggerToast]
   );
 
   const handleFormatChange = (newFormat) => {
-    updateActiveDeck((deck) => {
-      let nextEntries = [...deck.entries];
-      if (newFormat !== 'commander') {
-        // Move commander into mainboard when switching to 60-card formats
-        nextEntries = nextEntries.map((e) =>
-          e.zone === 'commander' ? { ...e, zone: 'mainboard' } : e
+    fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}`), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'set-format', format: newFormat })
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((view) => {
+        if (!view) return;
+        setServerDeckView(view);
+        setDecks((current) =>
+          current.map((deck) => deck.id === view.deck.id ? view.deck : deck)
         );
-      }
-      return { ...deck, format: newFormat, entries: nextEntries };
-    });
+      });
     triggerToast(`Format switched to ${newFormat.toUpperCase()} — rules re-validated!`);
   };
 
   const handleCreateDeck = (e) => {
     e.preventDefault();
-    const title = newDeckName.trim() || 'Untitled Arcane Brew';
-    const created = {
-      id: `deck-${Date.now()}`,
-      name: title,
-      format: newDeckFormat,
-      description: `Custom ${newDeckFormat.toUpperCase()} deck created in ArcaneForge.`,
-      entries:
-        newDeckFormat === 'commander'
-          ? [{ card: CARD_MAP['Niv-Mizzet, Parun'], quantity: 1, zone: 'commander' }]
-          : [{ card: CARD_MAP['Lightning Bolt'], quantity: 4, zone: 'mainboard' }]
-    };
-    setDecks((prev) => [...prev, created]);
-    setActiveDeckId(created.id);
-    setNewDeckName('');
-    setShowNewDeckModal(false);
-    triggerToast(`Created new ${newDeckFormat.toUpperCase()} deck "${title}"`);
+    fetch(apiUrl('/api/decks'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: newDeckName.trim() || 'Untitled Arcane Brew',
+        format: newDeckFormat,
+        entries: []
+      })
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((created) => {
+        if (!created) return;
+        setDecks((current) => [...current, created]);
+        setActiveDeckId(created.id);
+        setNewDeckName('');
+        setShowNewDeckModal(false);
+        triggerToast(`Created new ${created.format.toUpperCase()} deck "${created.name}"`);
+      });
   };
 
   const handleResetDemoDecks = () => {
-    setDecks(INITIAL_DECKS);
-    setActiveDeckId(INITIAL_DECKS[0].id);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(INITIAL_DECKS));
-    triggerToast('Reset all starter decks to factory defaults!');
+    fetch(apiUrl('/api/decks/demo/reset'), { method: 'POST' })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result) => {
+        if (!result) return;
+        setDecks(result.decks);
+        setActiveDeckId(result.decks[0]?.id);
+        triggerToast('Reset all starter decks to factory defaults!');
+      });
   };
 
   // Inject an intentional rule violation (Demonic Tutor in Izzet Commander) for live demo grading!
@@ -1361,86 +1160,24 @@ export default function App() {
     triggerToast('Added Demonic Tutor (Black) to demonstrate live Color Identity & Banlist validation!', 'warn');
   };
 
-  // --- Computed Validation & Analytics ---
-  const validation = useMemo(() => validateDeck(activeDeck), [activeDeck]);
-
-  const analytics = useMemo(() => {
-    const curveBins = [
-      { cmc: '0', count: 0 },
-      { cmc: '1', count: 0 },
-      { cmc: '2', count: 0 },
-      { cmc: '3', count: 0 },
-      { cmc: '4', count: 0 },
-      { cmc: '5', count: 0 },
-      { cmc: '6+', count: 0 },
-    ];
-
-    const colorCounts = { W: 0, U: 0, B: 0, R: 0, G: 0, C: 0 };
-    const typeCounts = {
-      Creatures: 0,
-      'Instants & Sorceries': 0,
-      'Artifacts & Enchantments': 0,
-      Planeswalkers: 0,
-      Lands: 0
-    };
-
-    let totalEur = 0;
-    let totalUsd = 0;
-    let totalNonLandCmc = 0;
-    let totalNonLandCards = 0;
-
-    activeDeck.entries.forEach(({ card, quantity, zone }) => {
-      const eur = parseFloat(card.prices?.eur || '0') || 0;
-      const usd = parseFloat(card.prices?.usd || '0') || 0;
-      totalEur += eur * quantity;
-      totalUsd += usd * quantity;
-
-      if (zone === 'sideboard') return;
-
-      const cat = getPrimaryCategory(card.type_line);
-      if (typeCounts[cat] !== undefined) {
-        typeCounts[cat] += quantity;
-      }
-
-      const isLand = (card.type_line || '').toLowerCase().includes('land');
-      if (!isLand) {
-        const cmcVal = Math.floor(Number(card.cmc) || 0);
-        totalNonLandCmc += cmcVal * quantity;
-        totalNonLandCards += quantity;
-
-        if (cmcVal >= 6) curveBins[6].count += quantity;
-        else if (cmcVal >= 0) curveBins[cmcVal].count += quantity;
-      }
-
-      // Count mana pips / color identity representation
-      const idColors = card.color_identity || [];
-      if (idColors.length === 0 && !isLand) {
-        colorCounts.C += quantity;
-      } else {
-        idColors.forEach((c) => {
-          if (colorCounts[c] !== undefined) colorCounts[c] += quantity;
-        });
-      }
-    });
-
-    const avgCmc = totalNonLandCards > 0 ? (totalNonLandCmc / totalNonLandCards).toFixed(2) : '0.00';
-
-    const colorPieData = MANA_COLORS.map((mc) => ({
-      name: mc.name,
-      code: mc.code,
-      value: colorCounts[mc.code] || 0,
-      color: mc.accent
-    })).filter((d) => d.value > 0);
-
-    return {
-      curveBins,
-      colorPieData,
-      typeCounts,
-      totalEur: totalEur.toFixed(2),
-      totalUsd: totalUsd.toFixed(2),
-      avgCmc
-    };
-  }, [activeDeck]);
+  // Validation and analytics are server-owned.
+  const validation = serverDeckView?.validation || {
+    overall: 'incomplete',
+    checks: [],
+    counts: { commanderCount: 0, mainCount: 0, sideCount: 0, totalMainAndCommander: 0 }
+  };
+  const analytics = serverDeckView?.analytics || {
+    curveBins: [
+      { cmc: '0', count: 0 }, { cmc: '1', count: 0 }, { cmc: '2', count: 0 },
+      { cmc: '3', count: 0 }, { cmc: '4', count: 0 }, { cmc: '5', count: 0 },
+      { cmc: '6+', count: 0 }
+    ],
+    colorPieData: [],
+    typeCounts: {},
+    totalEur: '0.00',
+    totalUsd: '0.00',
+    avgCmc: '0.00'
+  };
 
   // Group active deck entries into clean visual sections
   const groupedSections = useMemo(() => {
@@ -1474,26 +1211,17 @@ export default function App() {
 
   // --- Opening Hand Playtest Simulator Functions ---
   const startNewOpeningHand = useCallback(
-    (mulligans = 0) => {
-      const pool = [];
-      activeDeck.entries.forEach((entry) => {
-        if (entry.zone === 'mainboard') {
-          for (let i = 0; i < entry.quantity; i++) {
-            pool.push(entry.card);
-          }
-        }
+    async (mulligans = 0) => {
+      const response = await fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}/playtest`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mulligans })
       });
-
-      // Fisher-Yates shuffle
-      for (let i = pool.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [pool[i], pool[j]] = [pool[j], pool[i]];
-      }
-
-      const drawCount = Math.max(1, 7 - mulligans);
-      setPlaytestHand(pool.slice(0, drawCount));
-      setPlaytestLibrary(pool.slice(drawCount));
-      setMulliganCount(mulligans);
+      if (!response.ok) return;
+      const result = await response.json();
+      setPlaytestHand(result.hand);
+      setPlaytestLibrary(result.library);
+      setMulliganCount(result.mulliganCount);
     },
     [activeDeck.entries]
   );
@@ -1506,29 +1234,7 @@ export default function App() {
   };
 
   // --- MTG Arena Text Export & Import ---
-  const exportedArenaText = useMemo(() => {
-    const lines = [];
-    const cmdrs = activeDeck.entries.filter((e) => e.zone === 'commander');
-    const mains = activeDeck.entries.filter((e) => e.zone === 'mainboard');
-    const sides = activeDeck.entries.filter((e) => e.zone === 'sideboard');
-
-    if (cmdrs.length > 0) {
-      lines.push('Commander');
-      cmdrs.forEach((e) => lines.push(`${e.quantity} ${e.card.name}`));
-      lines.push('');
-    }
-
-    lines.push('Deck');
-    mains.forEach((e) => lines.push(`${e.quantity} ${e.card.name}`));
-
-    if (sides.length > 0) {
-      lines.push('');
-      lines.push('Sideboard');
-      sides.forEach((e) => lines.push(`${e.quantity} ${e.card.name}`));
-    }
-
-    return lines.join('\n');
-  }, [activeDeck]);
+  const exportedArenaText = serverDeckView?.arenaExport || '';
 
   const handleCopyExport = () => {
     navigator.clipboard.writeText(exportedArenaText);
@@ -1540,63 +1246,25 @@ export default function App() {
   const handleImportDeckText = async () => {
     if (!importText.trim()) return;
     setIsImporting(true);
-
-    const rawLines = importText.split('\n').map((l) => l.trim()).filter(Boolean);
-    let currentZone = 'mainboard';
-    const newEntries = [];
-
-    for (const line of rawLines) {
-      const lower = line.toLowerCase();
-      if (lower === 'commander' || lower === 'commander:') {
-        currentZone = 'commander';
-        continue;
-      }
-      if (lower === 'deck' || lower === 'mainboard' || lower === 'deck:') {
-        currentZone = 'mainboard';
-        continue;
-      }
-      if (lower === 'sideboard' || lower === 'sideboard:') {
-        currentZone = 'sideboard';
-        continue;
-      }
-
-      // Parse "4 Lightning Bolt (2X2) 117" -> qty=4, name="Lightning Bolt"
-      const match = line.match(/^(\d+)x?\s+([^(]+?)(?:\s+\([A-Za-z0-9]+\).*)?$/);
-      const qty = match ? parseInt(match[1], 10) : 1;
-      const rawName = (match ? match[2] : line).trim();
-      if (!rawName) continue;
-
-      // Check local cache first, otherwise fetch from Scryfall fuzzy endpoint
-      let foundCard = PRELOADED_CARDS.find(
-        (c) => c.name.toLowerCase() === rawName.toLowerCase()
+    try {
+      const response = await fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}`), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'import-arena', text: importText })
+      });
+      if (!response.ok) throw new Error('Import failed');
+      const view = await response.json();
+      setServerDeckView(view);
+      setDecks((current) =>
+        current.map((deck) => deck.id === view.deck.id ? view.deck : deck)
       );
-
-      if (!foundCard) {
-        try {
-          const res = await fetch(
-            `https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(rawName)}`
-          );
-          if (res.ok) {
-            foundCard = await res.json();
-          }
-        } catch (e) {
-          // ignore network error
-        }
-      }
-
-      if (foundCard) {
-        newEntries.push({ card: foundCard, quantity: qty, zone: currentZone });
-      }
-    }
-
-    setIsImporting(false);
-    if (newEntries.length > 0) {
-      updateActiveDeck((deck) => ({ ...deck, entries: newEntries }));
       setShowImportExportModal(false);
       setImportText('');
-      triggerToast(`Imported ${newEntries.length} unique card entries into ${activeDeck.name}!`);
-    } else {
-      triggerToast('Could not match any card names from pasted text.', 'warn');
+      triggerToast(`Imported deck text into ${activeDeck.name}!`);
+    } catch {
+      triggerToast('Could not import the deck text.', 'warn');
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -1714,7 +1382,7 @@ export default function App() {
                 )}
                 <button
                   onClick={async () => {
-                    await fetch('/api/auth/logout', { method: 'POST' });
+                    await fetch(apiUrl('/api/auth/logout'), { method: 'POST' });
                     setUser(null);
                     setPersistenceReady(false);
                     triggerToast('Signed out.');
@@ -1728,13 +1396,13 @@ export default function App() {
             ) : (
               <div className="inline-flex items-center gap-1">
                 <a
-                  href="/api/auth/github"
+                  href={apiUrl('/api/auth/github')}
                   className="inline-flex items-center justify-center px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700"
                 >
                   GitHub
                 </a>
                 <a
-                  href="/api/auth/google"
+                  href={apiUrl('/api/auth/google')}
                   className="inline-flex items-center justify-center px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap bg-amber-500 hover:bg-amber-400 text-slate-950"
                 >
                   Google
@@ -2015,8 +1683,20 @@ export default function App() {
                     type="text"
                     value={activeDeck.name}
                     onChange={(e) =>
-                      updateActiveDeck((d) => ({ ...d, name: e.target.value }))
+                       setDecks((current) =>
+                         current.map((deck) =>
+                           deck.id === activeDeck.id ? { ...deck, name: e.target.value } : deck
+                         )
+                       )
                     }
+                    onBlur={(e) => {
+                       if (!activeDeck.id) return;
+                       fetch(apiUrl(`/api/decks/${encodeURIComponent(activeDeck.id)}`), {
+                         method: 'PATCH',
+                         headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify({ action: 'set-name', name: e.target.value })
+                       });
+                    }}
                     className="bg-transparent text-lg sm:text-xl font-extrabold text-slate-100 focus:outline-none focus:ring-1 focus:ring-amber-400/50 rounded px-1 -ml-1"
                     aria-label="Deck Name"
                   />
@@ -2415,22 +2095,10 @@ export default function App() {
                             .getData('text/plain')
                             .split(':');
                           const sourceName = source.slice(1).join(':');
-                          updateActiveDeck((deck) => {
-                            const fromIndex = deck.entries.findIndex(
-                              (entry) => entry.card.name === sourceName
-                            );
-                            const toIndex = deck.entries.findIndex(
-                              (entry) =>
-                                entry.card.name === card.name && entry.zone === zone
-                            );
-                            if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
-                              return deck;
-                            }
-                            const nextEntries = [...deck.entries];
-                            const [moved] = nextEntries.splice(fromIndex, 1);
-                            nextEntries.splice(toIndex, 0, moved);
-                            return { ...deck, entries: nextEntries };
-                          });
+                          const sourceZone = source[0];
+                          if (sourceName && sourceZone !== zone) {
+                            moveCardZone(card, sourceZone, zone);
+                          }
                           setFanIndex(index);
                         }}
                         className={`stack-card ${
