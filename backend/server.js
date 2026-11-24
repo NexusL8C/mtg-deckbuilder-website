@@ -53,7 +53,7 @@ function ensureDbReady() {
 }
 
 app.use(async (_req, _res, next) => {
-  if (pool && isDbConnected) {
+  if (pool) {
     await ensureDbReady();
   }
   next();
@@ -226,6 +226,18 @@ async function initDatabase() {
 
     await client.query('COMMIT');
     isDbConnected = true;
+
+    // Seed starter decks after the transaction commits so the demo user FK is visible.
+    const starterDeckCount = await pool.query(
+      'SELECT COUNT(*)::int AS count FROM decks'
+    );
+    if (starterDeckCount.rows[0].count === 0) {
+      const starterDecks = readDecksFromDisk();
+      for (const starterDeck of starterDecks) {
+        await saveDeckToPostgres(starterDeck, DEMO_USER_ID);
+      }
+    }
+
     console.log('✅ PostgreSQL Schema initialized on Neon: users, cards, decks, deck_cards ready!');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1189,9 +1201,18 @@ app.get('/api/cards/named', async (req, res) => {
 
 app.post('/api/decks/demo/reset', async (req, res) => {
   try {
+    const starterDecks = readDecksFromDisk();
+    if (pool && isDbConnected) {
+      await pool.query('DELETE FROM decks');
+      for (const deck of starterDecks) {
+        await saveDeckToPostgres(deck, DEMO_USER_ID);
+      }
+    } else {
+      writeDecksToDisk(starterDecks);
+    }
     const decks = pool && isDbConnected
       ? await readDecksFromPostgres(DEMO_USER_ID)
-      : readDecksFromDisk();
+      : starterDecks;
     res.json({ decks });
   } catch (error) {
     console.error('Failed to reset demo decks:', error);
